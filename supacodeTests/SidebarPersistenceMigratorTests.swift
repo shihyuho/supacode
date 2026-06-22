@@ -830,4 +830,263 @@ struct SidebarPersistenceMigratorTests {
       #expect(migrated.focusedWorktreeID == nil)
     }
   }
+
+  // MARK: - Remote-identity migration (schema v1 -> v2).
+
+  @Test func stripLegacyIDPrefixesRemovesFolderAndRemoteMarkers() {
+    #expect(SidebarPersistenceMigrator.stripLegacyIDPrefixes("/tmp/repo") == "/tmp/repo")
+    #expect(SidebarPersistenceMigrator.stripLegacyIDPrefixes("remote://me@box/srv") == "me@box/srv")
+    #expect(SidebarPersistenceMigrator.stripLegacyIDPrefixes("folder:/tmp/notes") == "/tmp/notes")
+    // A folder-remote id collapses both retired markers in one pass.
+    #expect(SidebarPersistenceMigrator.stripLegacyIDPrefixes("folder:remote://box/srv") == "box/srv")
+  }
+
+  @Test(.dependencies) func remoteIdentityMigrationDrainsLegacyConfigsAndRekeysIds() throws {
+    let storage = InMemorySettingsFileStorage()
+    // A schema-v1 sidebar carrying the retired prefixes: a remote git section and
+    // a local folder row, plus a remote-keyed focus.
+    var legacySidebar = SidebarState()
+    legacySidebar.schemaVersion = 1
+    legacySidebar.sections[RepositoryID("remote://me@box/srv/repo")] = SidebarState.Section(
+      buckets: [.pinned: SidebarState.Bucket(items: [WorktreeID("remote://me@box/srv/repo"): .init()])]
+    )
+    legacySidebar.sections[RepositoryID("/tmp/notes")] = SidebarState.Section(
+      buckets: [.unpinned: SidebarState.Bucket(items: [WorktreeID("folder:/tmp/notes"): .init()])]
+    )
+    legacySidebar.focusedWorktreeID = WorktreeID("folder:/tmp/notes")
+    try storage.save(JSONEncoder().encode(legacySidebar), SupacodePaths.sidebarURL)
+
+    // Raw legacy settings.json with the retired `global.remoteRepositories`. Fed to
+    // the drain via `readFile` so a later settings save can't erase it mid-test.
+    let legacySettings = Data(
+      #"{"global":{"remoteRepositories":[{"host":{"alias":"box","username":"me"},"remotePath":"/srv/repo/"}]}}"#.utf8
+    )
+
+    try withDependencies {
+      $0.settingsFileStorage = SettingsFileStorage(
+        load: { try storage.load($0) },
+        save: { try storage.save($0, $1) }
+      )
+      $0.defaultAppStorage = .inMemory
+      $0.date = .constant(Date(timeIntervalSince1970: 1_700_000_000))
+    } operation: {
+      @Shared(.settingsFile) var settingsFile
+      $settingsFile.withLock {
+        $0.repositories = ["remote://me@box/srv/repo": .default]
+        $0.pinnedWorktreeIDs = ["remote://me@box/srv/repo"]
+      }
+      let readFile: (URL) -> Data? = { url in
+        url == SupacodePaths.settingsURL ? legacySettings : (try? storage.load(url))
+      }
+      let fileExists: (URL) -> Bool = { (try? storage.load($0)) != nil }
+
+      let captured = SidebarPersistenceMigrator.captureLegacyRemoteRoots(
+        fileExists: fileExists, readFile: readFile)
+      SidebarPersistenceMigrator.migrateRemoteIdentityIfNeeded(
+        capturedLegacy: captured, fileExists: fileExists, readFile: readFile)
+
+      // Legacy config drained into remoteRepositoryRoots (trailing slash normalized).
+      @Shared(.remoteRepositoryRoots) var remoteRepositoryRoots
+      #expect(remoteRepositoryRoots == ["me@box/srv/repo"])
+      // Per-repo settings + pins re-keyed off the retired prefixes.
+      #expect(settingsFile.repositories["me@box/srv/repo"] != nil)
+      #expect(settingsFile.repositories["remote://me@box/srv/repo"] == nil)
+      #expect(settingsFile.pinnedWorktreeIDs == ["me@box/srv/repo"])
+
+      // sidebar.json re-keyed and stamped v2.
+      let migrated = try JSONDecoder().decode(SidebarState.self, from: storage.load(SupacodePaths.sidebarURL))
+      #expect(migrated.schemaVersion == 2)
+      #expect(migrated.sections[RepositoryID("me@box/srv/repo")] != nil)
+      #expect(migrated.sections[RepositoryID("remote://me@box/srv/repo")] == nil)
+      #expect(
+        migrated.sections[RepositoryID("me@box/srv/repo")]?.buckets[.pinned]?
+          .items[WorktreeID("me@box/srv/repo")] != nil)
+      #expect(
+        migrated.sections[RepositoryID("/tmp/notes")]?.buckets[.unpinned]?
+          .items[WorktreeID("/tmp/notes")] != nil)
+      #expect(migrated.focusedWorktreeID == WorktreeID("/tmp/notes"))
+
+      // Idempotent: a second pass is a no-op (the v2 gate short-circuits).
+      let captured2 = SidebarPersistenceMigrator.captureLegacyRemoteRoots(
+        fileExists: fileExists, readFile: readFile)
+      SidebarPersistenceMigrator.migrateRemoteIdentityIfNeeded(
+        capturedLegacy: captured2, fileExists: fileExists, readFile: readFile)
+      #expect(remoteRepositoryRoots == ["me@box/srv/repo"])
+      let again = try JSONDecoder().decode(SidebarState.self, from: storage.load(SupacodePaths.sidebarURL))
+      #expect(again.schemaVersion == 2)
+      #expect(again.sections.count == 2)
+    }
+  }
+
+  @Test(.dependencies) func remoteIdentityMigrationBailsWhenSidebarPresentButUnreadable() throws {
+    let storage = InMemorySettingsFileStorage()
+    var existing = SidebarState()
+    existing.schemaVersion = 1
+    existing.sections["/tmp/repo"] = SidebarState.Section(
+      buckets: [.pinned: SidebarState.Bucket(items: ["/tmp/repo/wt": .init()])]
+    )
+    let existingBytes = try JSONEncoder().encode(existing)
+    try storage.save(existingBytes, SupacodePaths.sidebarURL)
+
+    try withDependencies {
+      $0.settingsFileStorage = SettingsFileStorage(load: { try storage.load($0) }, save: { try storage.save($0, $1) })
+      $0.defaultAppStorage = .inMemory
+      $0.date = .constant(Date(timeIntervalSince1970: 1_700_000_000))
+    } operation: {
+      // Present (fileExists true) but unreadable (readFile nil): must NOT overwrite
+      // the layout with empty state, and must NOT stamp v2 (so it retries).
+      SidebarPersistenceMigrator.migrateRemoteIdentityIfNeeded(
+        capturedLegacy: .none, fileExists: { _ in true }, readFile: { _ in nil })
+      let after = try JSONDecoder().decode(SidebarState.self, from: storage.load(SupacodePaths.sidebarURL))
+      #expect(after.schemaVersion == 1)
+      #expect(after.sections["/tmp/repo"] != nil)
+    }
+  }
+
+  @Test(.dependencies) func remoteIdentityMigrationAbortsWhenSettingsUnreadable() throws {
+    let storage = InMemorySettingsFileStorage()
+    var existing = SidebarState()
+    existing.schemaVersion = 1
+    try storage.save(try JSONEncoder().encode(existing), SupacodePaths.sidebarURL)
+
+    try withDependencies {
+      $0.settingsFileStorage = SettingsFileStorage(load: { try storage.load($0) }, save: { try storage.save($0, $1) })
+      $0.defaultAppStorage = .inMemory
+      $0.date = .constant(Date(timeIntervalSince1970: 1_700_000_000))
+    } operation: {
+      // settings.json present but unreadable -> capture is `.unreadable`; the pass
+      // must abort without stamping v2 so the legacy field survives to next launch.
+      let captured = SidebarPersistenceMigrator.captureLegacyRemoteRoots(
+        fileExists: { _ in true }, readFile: { _ in nil })
+      #expect(captured == .unreadable)
+      SidebarPersistenceMigrator.migrateRemoteIdentityIfNeeded(
+        capturedLegacy: captured, fileExists: { _ in true }, readFile: { try? storage.load($0) })
+      let after = try JSONDecoder().decode(SidebarState.self, from: storage.load(SupacodePaths.sidebarURL))
+      #expect(after.schemaVersion == 1)
+    }
+  }
+
+  @Test(.dependencies) func remoteIdentityMigrationKeepsFirstOnKeyCollision() throws {
+    let storage = InMemorySettingsFileStorage()
+    // Both a retired `remote://X` section and a bare `X` section exist; after the
+    // prefix strip they collide and the first-seen entry must win (no trap, no dupe).
+    var legacy = SidebarState()
+    legacy.schemaVersion = 1
+    legacy.sections["remote://me@box/srv/repo"] = SidebarState.Section(
+      buckets: [.pinned: SidebarState.Bucket(items: ["remote://me@box/srv/repo": .init(title: "first")])]
+    )
+    legacy.sections["me@box/srv/repo"] = SidebarState.Section(
+      buckets: [.unpinned: SidebarState.Bucket(items: ["me@box/srv/repo": .init(title: "second")])]
+    )
+    try storage.save(try JSONEncoder().encode(legacy), SupacodePaths.sidebarURL)
+
+    try withDependencies {
+      $0.settingsFileStorage = SettingsFileStorage(load: { try storage.load($0) }, save: { try storage.save($0, $1) })
+      $0.defaultAppStorage = .inMemory
+      $0.date = .constant(Date(timeIntervalSince1970: 1_700_000_000))
+    } operation: {
+      SidebarPersistenceMigrator.migrateRemoteIdentityIfNeeded(
+        capturedLegacy: .none, fileExists: { (try? storage.load($0)) != nil }, readFile: { try? storage.load($0) })
+      let migrated = try JSONDecoder().decode(SidebarState.self, from: storage.load(SupacodePaths.sidebarURL))
+      #expect(migrated.sections.count == 1)
+      #expect(migrated.sections["me@box/srv/repo"]?.buckets[.pinned]?.items["me@box/srv/repo"]?.title == "first")
+    }
+  }
+
+  @Test(.dependencies) func remoteIdentityMigrationRekeysTerminalLayouts() throws {
+    let storage = InMemorySettingsFileStorage()
+    var sidebar = SidebarState()
+    sidebar.schemaVersion = 1
+    try storage.save(try JSONEncoder().encode(sidebar), SupacodePaths.sidebarURL)
+    // Terminal layouts keyed by the retired worktree-id prefixes must follow the
+    // ids, or remote/folder tabs won't restore after upgrade.
+    let snapshot = TerminalLayoutSnapshot(tabs: [], selectedTabIndex: 0)
+    let layouts: [String: TerminalLayoutSnapshot] = [
+      "remote://me@box/srv/repo": snapshot,
+      "folder:/tmp/notes": snapshot,
+      "/tmp/local/wt": snapshot,
+    ]
+    try storage.save(try JSONEncoder().encode(layouts), SupacodePaths.layoutsURL)
+
+    try withDependencies {
+      $0.settingsFileStorage = SettingsFileStorage(load: { try storage.load($0) }, save: { try storage.save($0, $1) })
+      $0.defaultAppStorage = .inMemory
+      $0.date = .constant(Date(timeIntervalSince1970: 1_700_000_000))
+    } operation: {
+      SidebarPersistenceMigrator.migrateRemoteIdentityIfNeeded(
+        capturedLegacy: .none, fileExists: { (try? storage.load($0)) != nil }, readFile: { try? storage.load($0) })
+      let migrated = try JSONDecoder().decode(
+        [String: TerminalLayoutSnapshot].self, from: storage.load(SupacodePaths.layoutsURL))
+      #expect(migrated["me@box/srv/repo"] != nil)
+      #expect(migrated["/tmp/notes"] != nil)
+      #expect(migrated["/tmp/local/wt"] != nil)
+      #expect(migrated["remote://me@box/srv/repo"] == nil)
+      #expect(migrated["folder:/tmp/notes"] == nil)
+    }
+  }
+
+  @Test(.dependencies) func backupSnapshotsSettingsAndSidebarBeforeMigrating() throws {
+    let storage = InMemorySettingsFileStorage()
+    let settingsData = Data(#"{"global":{"remoteRepositories":[]},"repositoryRoots":["/tmp/repo"]}"#.utf8)
+    try storage.save(settingsData, SupacodePaths.settingsURL)
+    var sidebar = SidebarState()
+    sidebar.schemaVersion = 1
+    let sidebarData = try JSONEncoder().encode(sidebar)
+    try storage.save(sidebarData, SupacodePaths.sidebarURL)
+
+    withDependencies {
+      $0.settingsFileStorage = SettingsFileStorage(load: { try storage.load($0) }, save: { try storage.save($0, $1) })
+      $0.defaultAppStorage = .inMemory
+    } operation: {
+      SidebarPersistenceMigrator.backupBeforeRemoteIdentityMigration(
+        fileExists: { (try? storage.load($0)) != nil }, readFile: { try? storage.load($0) })
+      let suffix = SidebarPersistenceMigrator.preMigrationBackupSuffix
+      let settingsBak = SupacodePaths.settingsURL.deletingLastPathComponent()
+        .appendingPathComponent(SupacodePaths.settingsURL.lastPathComponent + suffix)
+      let sidebarBak = SupacodePaths.sidebarURL.deletingLastPathComponent()
+        .appendingPathComponent(SupacodePaths.sidebarURL.lastPathComponent + suffix)
+      #expect((try? storage.load(settingsBak)) == settingsData)
+      #expect((try? storage.load(sidebarBak)) == sidebarData)
+    }
+  }
+
+  @Test(.dependencies) func backupSkipsOnceMigrated() throws {
+    let storage = InMemorySettingsFileStorage()
+    try storage.save(Data("{}".utf8), SupacodePaths.settingsURL)
+    var sidebar = SidebarState()
+    sidebar.schemaVersion = 2
+    try storage.save(try JSONEncoder().encode(sidebar), SupacodePaths.sidebarURL)
+
+    withDependencies {
+      $0.settingsFileStorage = SettingsFileStorage(load: { try storage.load($0) }, save: { try storage.save($0, $1) })
+      $0.defaultAppStorage = .inMemory
+    } operation: {
+      SidebarPersistenceMigrator.backupBeforeRemoteIdentityMigration(
+        fileExists: { (try? storage.load($0)) != nil }, readFile: { try? storage.load($0) })
+      let settingsBak = SupacodePaths.settingsURL.deletingLastPathComponent()
+        .appendingPathComponent(
+          SupacodePaths.settingsURL.lastPathComponent + SidebarPersistenceMigrator.preMigrationBackupSuffix)
+      #expect((try? storage.load(settingsBak)) == nil)
+    }
+  }
+
+  @Test(.dependencies) func remoteIdentityMigrationDrainsRemotesEvenWhenSidebarUnreadable() throws {
+    let storage = InMemorySettingsFileStorage()
+    // Sidebar present but unreadable: the re-key bails, but the captured remotes
+    // must still be drained to their new home, not discarded.
+    try storage.save(Data("not json".utf8), SupacodePaths.sidebarURL)
+
+    withDependencies {
+      $0.settingsFileStorage = SettingsFileStorage(load: { try storage.load($0) }, save: { try storage.save($0, $1) })
+      $0.defaultAppStorage = .inMemory
+      $0.date = .constant(Date(timeIntervalSince1970: 1_700_000_000))
+    } operation: {
+      SidebarPersistenceMigrator.migrateRemoteIdentityIfNeeded(
+        capturedLegacy: .roots(["me@box/srv/repo"]),
+        fileExists: { (try? storage.load($0)) != nil },
+        readFile: { try? storage.load($0) })
+      @Shared(.remoteRepositoryRoots) var remoteRepositoryRoots
+      #expect(remoteRepositoryRoots == ["me@box/srv/repo"])
+    }
+  }
 }
