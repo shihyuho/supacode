@@ -1090,6 +1090,17 @@ final class WorktreeTerminalManager {
     emitProjection(for: worktreeID)
   }
 
+  /// Indicator and projection updates propagate via each state's notification
+  /// callbacks. Every state is swept, not just the unread ones, so a surface
+  /// whose unseen mirror drifted out of sync with its notifications is repaired.
+  func markAllNotificationsRead() {
+    let unread = states.values.count(where: \.hasUnseenNotification)
+    terminalLogger.info("markAllNotificationsRead: clearing unread in \(unread) worktree(s).")
+    for state in states.values {
+      state.markAllNotificationsRead()
+    }
+  }
+
   /// Embed `agentsBySurface` in each surface so badges survive relaunch.
   func saveAllLayoutSnapshots(
     agentsBySurface: [UUID: [TerminalLayoutSnapshot.SurfaceAgentRecord]] = [:]

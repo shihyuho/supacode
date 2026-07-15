@@ -59,6 +59,20 @@ public struct AppearanceSettingsView: View {
           )
         }
       }
+      Section {
+        LabeledContent("Visibility") {
+          HStack(spacing: 12) {
+            ForEach(AppVisibility.allCases) { visibility in
+              AppVisibilityOptionCardView(
+                visibility: visibility,
+                isSelected: visibility == store.appVisibility
+              ) {
+                store.send(.setAppVisibility(visibility))
+              }
+            }
+          }
+        }
+      }
       Section("Editor") {
         // The stored id deliberately keeps naming an uninstalled editor, so the choice
         // survives a reinstall. No row is tagged with it though, and an untagged

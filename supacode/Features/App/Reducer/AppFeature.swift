@@ -159,6 +159,7 @@ struct AppFeature {
     var hasAnyTerminalSurface: Bool = false
     var lastKnownSystemNotificationsEnabled: Bool
     var lastKnownAgentPresenceBadgesEnabled: Bool
+    var lastKnownAppVisibility: AppVisibility
     var pendingDeeplinks: [Deeplink] = []
     var isDeeplinkReferenceRequested = false
     /// Cached projection of every primitive the menu-bar `WorktreeCommands`
@@ -197,6 +198,7 @@ struct AppFeature {
       self.settings = settings
       lastKnownSystemNotificationsEnabled = settings.systemNotificationsEnabled
       lastKnownAgentPresenceBadgesEnabled = settings.agentPresenceBadgesEnabled
+      lastKnownAppVisibility = settings.appVisibility
       // Seed from settings so `state.allScripts` doesn't start empty before the
       // first `settingsChanged` delegate fires. Globals aren't worktree-scoped,
       // so deselection (line below in `selectedWorktreeChanged(nil)`)
@@ -304,6 +306,8 @@ struct AppFeature {
     case selectTerminalTabAtIndex(Int)
     case splitTerminal(TerminalSplitMenuDirection)
     case jumpToLatestUnread
+    case menuBarWorktreeSelected(worktreeID: Worktree.ID)
+    case markAllNotificationsRead
     case runScript
     case runNamedScript(ScriptDefinition)
     case manageRepositoryScripts
@@ -634,6 +638,13 @@ struct AppFeature {
         let agentBadgesFlipped =
           settings.agentPresenceBadgesEnabled != state.lastKnownAgentPresenceBadgesEnabled
         state.lastKnownAgentPresenceBadgesEnabled = settings.agentPresenceBadgesEnabled
+        let visibilityChanged = settings.appVisibility != state.lastKnownAppVisibility
+        let previousVisibility = state.lastKnownAppVisibility
+        // Surface the main window when the Dock icon comes back, so leaving
+        // menu-bar-only mode never strands the user without a window.
+        let dockIconReappeared =
+          state.lastKnownAppVisibility.hidesDockIcon && !settings.appVisibility.hidesDockIcon
+        state.lastKnownAppVisibility = settings.appVisibility
         // Compare IDs as a set: name/command edits and pure reorders should not re-prune recency.
         let globalScriptIDsChanged = Set(state.globalScripts.map(\.id)) != Set(settings.globalScripts.map(\.id))
         state.globalScripts = settings.globalScripts
@@ -698,6 +709,23 @@ struct AppFeature {
             }
           },
         ]
+        if visibilityChanged {
+          effects.append(
+            .run { @MainActor send in
+              // The status item is already gone by now (the `MenuBarExtra`
+              // binding reads the new value on the same scene pass), so a
+              // refused policy switch would leave no surface at all. Fall back
+              // to the previous mode, which puts one of them back.
+              guard appLifecycleClient.applyVisibility(settings.appVisibility) else {
+                await send(.settings(.setAppVisibility(previousVisibility)))
+                return
+              }
+              if dockIconReappeared {
+                _ = appLifecycleClient.surfaceMainWindow()
+              }
+            }
+          )
+        }
         if globalScriptIDsChanged {
           effects.append(pruneScriptRecencyEffect(state: state))
         }
@@ -881,6 +909,27 @@ struct AppFeature {
             await terminalClient.markNotificationRead(location.worktreeID, location.notificationID)
           }
         )
+
+      case .menuBarWorktreeSelected(let worktreeID):
+        // The menu snapshots its rows when it opens, so the worktree can be
+        // archived or deleted before the click lands. Surface the app anyway:
+        // in menu bar mode a dead click is indistinguishable from a hang.
+        guard state.repositories.worktree(for: worktreeID) != nil else {
+          jumpLogger.warning(
+            "menuBarWorktreeSelected: worktree \(worktreeID) vanished between menu render and click."
+          )
+          analyticsClient.capture("menu_bar_worktree_selected_stale", nil)
+          return .run { @MainActor _ in _ = appLifecycleClient.surfaceMainWindow() }
+        }
+        analyticsClient.capture("menu_bar_worktree_selected", nil)
+        return .merge(
+          .send(.repositories(.selectWorktree(worktreeID, focusTerminal: true))),
+          .run { @MainActor _ in _ = appLifecycleClient.surfaceMainWindow() }
+        )
+
+      case .markAllNotificationsRead:
+        analyticsClient.capture("notifications_mark_all_read", nil)
+        return .run { _ in await terminalClient.markAllNotificationsRead() }
 
       case .runScript:
         // An empty `repoScripts` means "this repository configures no run script" only

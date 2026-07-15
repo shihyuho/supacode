@@ -76,17 +76,20 @@ final class SupacodeAppDelegate: NSObject, NSApplicationDelegate {
     // the main window. Opt the singleton out per-process so a panel
     // left open from a previous session can't survive the relaunch.
     NSColorPanel.shared.isRestorable = false
-    appStore?.send(.appLaunched)
+    guard let appStore else {
+      SupaLogger("App").error("applicationDidFinishLaunching with no store; launch setup skipped.")
+      return
+    }
+    // Apply the saved Dock/menu-bar visibility before the first window shows.
+    NSApplication.shared.applyActivationPolicy(for: appStore.state.settings.appVisibility)
+    appStore.send(.appLaunched)
   }
 
   func applicationDidBecomeActive(_ notification: Notification) {
     appStore?.send(.applicationDidBecomeActive)
     let app = NSApplication.shared
-    // Filter `NSPanel` out of the visibility check — the system
-    // color / font panels (and any sheet-attached child panels) are
-    // not "main windows" that should suppress surfacing.
     let hasVisibleMainWindow = app.windows.contains { window in
-      window.isVisible && !(window is NSPanel)
+      window.isVisible && window.isSurfaceableAppWindow
     }
     guard !hasVisibleMainWindow else { return }
     app.surfaceMainWindow()
@@ -269,6 +272,9 @@ struct SupacodeApp: App {
         },
         markNotificationRead: { worktreeID, notificationID in
           terminalManager.markNotificationRead(worktreeID: worktreeID, notificationID: notificationID)
+        },
+        markAllNotificationsRead: {
+          terminalManager.markAllNotificationsRead()
         },
         hasInflightBlockingScripts: {
           terminalManager.hasInflightBlockingScripts
@@ -578,5 +584,26 @@ struct SupacodeApp: App {
     .windowToolbarStyle(.unified)
     .defaultSize(width: 720, height: 640)
     .restorationBehavior(.disabled)
+    MenuBarExtra(isInserted: menuBarInserted) {
+      MenuBarNotificationsMenu(store: store)
+    } label: {
+      MenuBarNotificationsLabel(store: store)
+    }
+    // `.window`, not `.menu`: a native menu item can't host the sidebar row's
+    // dots, agent badges, and diff stats. The panel is styled to read like a menu.
+    .menuBarExtraStyle(.window)
+  }
+
+  /// Dragging the status item out of the menu bar falls back to `.dock`, so at
+  /// least one surface stays enabled.
+  private var menuBarInserted: Binding<Bool> {
+    Binding(
+      get: { store.settings.appVisibility.showsMenuBarIcon },
+      set: { newValue in
+        // Ignore MenuBarExtra's scene-evaluation echo; only a real flip should persist.
+        guard newValue != store.settings.appVisibility.showsMenuBarIcon else { return }
+        store.send(.settings(.setAppVisibility(newValue ? .dockAndMenuBar : .dock)))
+      }
+    )
   }
 }
